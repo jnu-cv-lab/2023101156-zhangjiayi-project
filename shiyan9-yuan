@@ -1,0 +1,207 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, random_split
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import matplotlib.font_manager as fm
+# 设置中文字体
+font_url = "https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf"
+font_path = "SimHei.ttf"
+if not os.path.exists(font_path):
+    try:
+        urllib.request.urlretrieve(font_url, font_path)
+        print("中文字体下载完成")
+    except Exception as e:
+        print(f"字体下载失败: {e}")
+if os.path.exists(font_path):
+    fm.fontManager.addfont(font_path)
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+# 1. 设置设备
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"使用设备: {device}")
+
+# 2. 加载数据集（MNIST）
+transform = transforms.Compose([
+    transforms.ToTensor(),          # 转为 [0,1] 的 Tensor
+    transforms.Normalize((0.1307,), (0.3081,))  # MNIST 均值和标准差
+])
+
+full_train_set = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+test_set = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+
+# 划分训练集和验证集（8:2）
+train_size = int(0.8 * len(full_train_set))
+val_size = len(full_train_set) - train_size
+train_set, val_set = random_split(full_train_set, [train_size, val_size])
+
+# 创建 DataLoader
+batch_size = 64
+train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
+test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
+
+# 显示样本图像及标签（至少8张）
+def show_samples(dataset, num=8):
+    fig, axes = plt.subplots(1, num, figsize=(12, 3))
+    for i in range(num):
+        img, label = dataset[i]
+        axes[i].imshow(img.squeeze(), cmap='gray')
+        axes[i].set_title(f'Label: {label}')
+        axes[i].axis('off')
+    plt.suptitle('样本图像示例')
+    plt.tight_layout()
+    plt.savefig('sample_images.png')
+    plt.show()
+
+show_samples(train_set, 8)
+
+# 3. 定义 CNN 模型
+class SimpleCNN(nn.Module):
+    def __init__(self):
+        super(SimpleCNN, self).__init__()
+        # 卷积块1: 输入通道1 (灰度图) -> 输出32通道
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        self.relu1 = nn.ReLU()
+        self.pool1 = nn.MaxPool2d(2, 2)  # 28x28 -> 14x14
+        
+        # 卷积块2: 32 -> 64通道
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.relu2 = nn.ReLU()
+        self.pool2 = nn.MaxPool2d(2, 2)  # 14x14 -> 7x7
+        
+        # 全连接层: 64 * 7 * 7 = 3136 -> 128 -> 10
+        self.fc1 = nn.Linear(64 * 7 * 7, 128)
+        self.relu3 = nn.ReLU()
+        self.fc2 = nn.Linear(128, 10)
+    
+    def forward(self, x):
+        x = self.pool1(self.relu1(self.conv1(x)))
+        x = self.pool2(self.relu2(self.conv2(x)))
+        x = x.view(x.size(0), -1)  # flatten
+        x = self.relu3(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+model = SimpleCNN().to(device)
+print(model)
+
+# 4. 损失函数和优化器
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# 用于记录指标
+train_losses, val_losses = [], []
+train_accs, val_accs = [], []
+
+# 训练函数
+def train_one_epoch():
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item() * images.size(0)
+        _, predicted = torch.max(outputs, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+    
+    avg_loss = total_loss / total
+    accuracy = correct / total
+    return avg_loss, accuracy
+
+# 验证函数
+def validate(loader):
+    model.eval()
+    total_loss = 0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, labels in loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item() * images.size(0)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    avg_loss = total_loss / total
+    accuracy = correct / total
+    return avg_loss, accuracy
+
+# 5. 训练循环（至少5个epoch）
+num_epochs = 5
+for epoch in range(1, num_epochs+1):
+    train_loss, train_acc = train_one_epoch()
+    val_loss, val_acc = validate(val_loader)
+    
+    train_losses.append(train_loss)
+    train_accs.append(train_acc)
+    val_losses.append(val_loss)
+    val_accs.append(val_acc)
+    
+    print(f'Epoch {epoch:2d} | '
+          f'Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | '
+          f'Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}')
+
+# 6. 测试集评估
+test_loss, test_acc = validate(test_loader)
+print(f'\n最终测试结果: Loss = {test_loss:.4f}, Accuracy = {test_acc:.4f}')
+
+# 显示至少8张测试图像，包括真实标签和预测标签
+def show_test_predictions(num=8):
+    model.eval()
+    images, labels = next(iter(test_loader))
+    images, labels = images.to(device), labels.to(device)
+    outputs = model(images)
+    _, preds = torch.max(outputs, 1)
+    
+    fig, axes = plt.subplots(1, num, figsize=(15, 3))
+    for i in range(num):
+        axes[i].imshow(images[i].cpu().squeeze(), cmap='gray')
+        axes[i].set_title(f'True:{labels[i].item()}\nPred:{preds[i].item()}')
+        axes[i].axis('off')
+    plt.suptitle('测试集预测结果')
+    plt.tight_layout()
+    plt.savefig('test_predictions.png')
+    plt.show()
+
+show_test_predictions(8)
+
+# 7. 绘制训练曲线
+epochs_range = range(1, num_epochs+1)
+
+plt.figure(figsize=(12, 4))
+
+plt.subplot(1, 2, 1)
+plt.plot(epochs_range, train_losses, 'b-', label='Training Loss')
+plt.plot(epochs_range, val_losses, 'r-', label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Loss Curves')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(1, 2, 2)
+plt.plot(epochs_range, train_accs, 'b-', label='Training Accuracy')
+plt.plot(epochs_range, val_accs, 'r-', label='Validation Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.title('Accuracy Curves')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.savefig('training_curves.png')
+plt.show()
