@@ -1,0 +1,146 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import matplotlib.font_manager as fm
+#中文字体设置
+font_url = "https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf"
+font_path = "SimHei.ttf"
+if not os.path.exists(font_path):
+    try:
+        urllib.request.urlretrieve(font_url, font_path)
+        print("中文字体下载完成")
+    except Exception as e:
+        print(f"字体下载失败: {e}")
+if os.path.exists(font_path):
+    fm.fontManager.addfont(font_path)
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+# ==================== 1. Sinusoidal Position Encoding ====================
+def sinusoidal_position_encoding(seq_len, d_model):
+    """
+    生成 sinusoidal position encoding，形状 (seq_len, d_model)
+    """
+    pe = np.zeros((seq_len, d_model))
+    position = np.arange(seq_len).reshape(-1, 1)
+    div_term = np.exp(np.arange(0, d_model, 2) * -(np.log(10000.0) / d_model))
+    pe[:, 0::2] = np.sin(position * div_term)
+    pe[:, 1::2] = np.cos(position * div_term)
+    return pe
+
+# ==================== 2. 二维向量旋转 ====================
+def rotate_2d(x, y, theta):
+    """二维向量旋转，角度 theta (弧度)"""
+    x_rot = x * np.cos(theta) - y * np.sin(theta)
+    y_rot = x * np.sin(theta) + y * np.cos(theta)
+    return x_rot, y_rot
+
+# ==================== 3. 高维 RoPE ====================
+def rope_embedding(x, positions):
+    """
+    对输入张量 x (batch, seq_len, d_model) 应用 RoPE
+    positions: 每个 token 的位置索引 (seq_len,)
+    d_model 必须为偶数，将相邻两维视为一个二维向量进行旋转
+    """
+    d_model = x.shape[-1]
+    assert d_model % 2 == 0, "d_model must be even"
+    half_dim = d_model // 2
+    # 将 x 分为两半，对应每个二维向量的两个分量
+    x1 = x[..., :half_dim]
+    x2 = x[..., half_dim:]
+    
+    # 预计算每个位置的旋转角度 theta = pos * (10000^(-2i/d_model))
+    inv_freq = 1.0 / (10000.0 ** (np.arange(0, half_dim, 1) / half_dim))
+    theta = np.outer(positions, inv_freq)  # (seq_len, half_dim)
+    cos_theta = np.cos(theta)
+    sin_theta = np.sin(theta)
+    
+    # 扩展维度以便广播
+    cos_theta = cos_theta[np.newaxis, :, :]  # (1, seq_len, half_dim)
+    sin_theta = sin_theta[np.newaxis, :, :]
+    
+    # 旋转: (x1, x2) -> (x1*cos - x2*sin, x1*sin + x2*cos)
+    x1_rot = x1 * cos_theta - x2 * sin_theta
+    x2_rot = x1 * sin_theta + x2 * cos_theta
+    return np.concatenate([x1_rot, x2_rot], axis=-1)
+
+# ==================== 4. 数值实验：验证 RoPE 的相对位置性质 ====================
+def test_rope_relative():
+    """通过点积验证 RoPE 编码后的向量点积只依赖于相对位置"""
+    np.random.seed(42)
+    d_model = 8   # 偶数
+    seq_len = 5
+    # 随机生成 query 和 key 的原始向量（无位置信息）
+    q = np.random.randn(1, seq_len, d_model)
+    k = np.random.randn(1, seq_len, d_model)
+    
+    # 对每个位置应用 RoPE
+    positions = np.arange(seq_len)
+    q_rope = rope_embedding(q, positions)
+    k_rope = rope_embedding(k, positions)
+    
+    # 计算不同位置对的点积
+    scores = np.zeros((seq_len, seq_len))
+    for i in range(seq_len):
+        for j in range(seq_len):
+            scores[i, j] = np.dot(q_rope[0, i], k_rope[0, j])
+    
+    # 绘制热力图，观察沿对角线的平移不变性
+    plt.figure(figsize=(6,5))
+    plt.imshow(scores, cmap='viridis')
+    plt.colorbar(label='Dot product')
+    plt.title('RoPE 点积热力图：依赖相对位置')
+    plt.xlabel('Key position')
+    plt.ylabel('Query position')
+    plt.show()
+    
+    # 比较 (i, j) 和 (i+1, j+1) 的点积是否近似相等
+    print("相对位置验证（应近似相等）：")
+    for i in range(seq_len-1):
+        for j in range(seq_len-1):
+            diff = scores[i,j] - scores[i+1,j+1]
+            print(f"pos({i},{j}) vs pos({i+1},{j+1}) diff = {diff:.6f}")
+    return scores
+
+# ==================== 5. 对比 E+pos 和 RoPE ====================
+def compare_embedding_ways():
+    """比较 E+pos 和 RoPE 的点积行为"""
+    d_model = 4
+    seq_len = 3
+    np.random.seed(0)
+    # 生成 token embedding (无位置)
+    X = np.random.randn(1, seq_len, d_model)
+    # Sinusoidal PE
+    pe = sinusoidal_position_encoding(seq_len, d_model)
+    X_pos = X + pe[np.newaxis, :, :]   # E+pos
+    
+    # RoPE
+    positions = np.arange(seq_len)
+    X_rope = rope_embedding(X, positions)
+    
+    # 计算不同 query/key 的点积
+    print("\n=== E+pos 方式 ===")
+    for i in range(seq_len):
+        for j in range(seq_len):
+            dot = np.dot(X_pos[0,i], X_pos[0,j])
+            print(f"pos({i},{j}) dot = {dot:.4f}")
+    
+    print("\n=== RoPE 方式 ===")
+    for i in range(seq_len):
+        for j in range(seq_len):
+            dot = np.dot(X_rope[0,i], X_rope[0,j])
+            print(f"pos({i},{j}) dot = {dot:.4f}")
+    
+    # 注意：由于随机生成，RoPE 的点积也会包含内容信息，但若内容相同则只依赖于相对位置
+    # 可额外构造内容相同但位置不同的情况
+    print("\n=== 验证 RoPE 相对位置性质（内容相同） ===")
+    same_content = np.ones((1, seq_len, d_model))   # 所有 token 内容相同
+    same_rope = rope_embedding(same_content, positions)
+    for i in range(seq_len):
+        for j in range(seq_len):
+            dot = np.dot(same_rope[0,i], same_rope[0,j])
+            print(f"pos({i},{j}) dot = {dot:.4f}")   # 应该只依赖于 (i-j)
+
+if __name__ == "__main__":
+    # 运行实验
+    test_rope_relative()
+    compare_embedding_ways()
