@@ -1,0 +1,122 @@
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+import torch.optim as optim
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"使用设备: {device}")
+# 加载预处理好的骨架数据
+X_train = np.load('X_train.npy')
+y_train = np.load('y_train.npy')
+X_test = np.load('X_test.npy')
+y_test = np.load('y_test.npy')
+
+print("训练集形状:", X_train.shape)
+print("测试集形状:", X_test.shape)
+
+# 在加载数据之后，定义模型之前添加
+classes = [
+    "forehand drive",
+    "forehand lift", 
+    "forehand net shot",
+    "forehand clear",
+    "backhand drive",
+    "backhand net shot"
+]
+
+# 然后继续定义 SkeletonDataset 类等
+class SkeletonTransformer(nn.Module):
+    def __init__(self, input_dim=132, d_model=128, nhead=4, num_layers=2, dim_feedforward=256, num_classes=6, dropout=0.1, max_len=30):
+        super().__init__()
+        self.embed = nn.Linear(input_dim, d_model)
+        self.pos_embed = nn.Parameter(torch.randn(1, max_len, d_model) * 0.02)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(d_model)
+        self.classifier = nn.Linear(d_model, num_classes)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        # x: [B, T, input_dim]
+        x = self.embed(x)               # [B, T, d_model]
+        x = x + self.pos_embed[:, :x.size(1), :]
+        x = self.transformer(x)         # [B, T, d_model]
+        x = x.mean(dim=1)               # 平均池化
+        x = self.norm(x)
+        x = self.dropout(x)
+        logits = self.classifier(x)
+        return logits
+    
+   
+
+class SkeletonDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
+    def __len__(self): return len(self.X)
+    def __getitem__(self, idx): return self.X[idx], self.y[idx]
+
+train_loader = DataLoader(SkeletonDataset(X_train, y_train), batch_size=16, shuffle=True)
+test_loader = DataLoader(SkeletonDataset(X_test, y_test), batch_size=16, shuffle=False)
+
+model = SkeletonTransformer().to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+def train_one_epoch():
+    model.train()
+    total_loss, correct, total = 0,0,0
+    for Xb, yb in train_loader:
+        Xb, yb = Xb.to(device), yb.to(device)   # 改为 .to(device)
+        optimizer.zero_grad()
+        logits = model(Xb)
+        loss = criterion(logits, yb)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * Xb.size(0)
+        pred = logits.argmax(1)
+        correct += (pred == yb).sum().item()
+        total += yb.size(0)
+    return total_loss/total, correct/total
+
+def evaluate(loader):
+    model.eval()
+    correct, total = 0,0
+    with torch.no_grad():
+        for Xb, yb in loader:
+            Xb, yb = Xb.to(device), yb.to(device)   # ← 改为 .to(device)
+            logits = model(Xb)
+            pred = logits.argmax(1)
+            correct += (pred == yb).sum().item()
+            total += yb.size(0)
+    return correct/total
+
+epochs = 20
+for epoch in range(1, epochs+1):
+    train_loss, train_acc = train_one_epoch()
+    test_acc = evaluate(test_loader)
+    print(f"Epoch {epoch:2d} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Test Acc: {test_acc:.4f}")
+
+# 最终测试集评估
+test_acc = evaluate(test_loader)
+print(f"Final Test Accuracy: {test_acc:.4f}")
+
+# 混淆矩阵
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
+model.eval()
+y_true, y_pred = [], []
+with torch.no_grad():
+    for Xb, yb in test_loader:
+        Xb = Xb.to(device)
+        logits = model(Xb)
+        pred = logits.argmax(1).cpu().numpy()
+        y_true.extend(yb.numpy())
+        y_pred.extend(pred)
+cm = confusion_matrix(y_true, y_pred)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=classes)
+disp.plot()
+plt.title("Confusion Matrix")
+plt.savefig("confusion_matrix.png")
+plt.show()
+torch.save(model.state_dict(), 'skeleton_transformer.pth')

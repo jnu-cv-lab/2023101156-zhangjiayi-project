@@ -1,0 +1,112 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import os
+from sklearn.model_selection import train_test_split
+
+# 初始化 MediaPipe Pose
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(
+    static_image_mode=False,
+    model_complexity=1,
+    min_detection_confidence=0.5
+)
+
+def extract_keypoints(video_path, target_frames=30):
+    """
+    从视频中提取归一化后的骨架序列
+    返回: shape (target_frames, 132) 或 None（未检测到人体）
+    """
+    cap = cv2.VideoCapture(video_path)
+    frames = []   # 存储每帧的原始关键点（未归一化）
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb)
+        if results.pose_landmarks:
+            landmarks = results.pose_landmarks.landmark
+            # 提取所有关键点的 x, y, z, visibility
+            raw_kp = []
+            for lm in landmarks:
+                raw_kp.extend([lm.x, lm.y, lm.z, lm.visibility])
+            frames.append(raw_kp)
+    cap.release()
+    
+    if len(frames) == 0:
+        return None
+    
+    # 重采样到固定帧数（线性插值）
+    old_len = len(frames)
+    indices = np.linspace(0, old_len - 1, target_frames).astype(int)
+    resampled = np.array([frames[i] for i in indices], dtype=np.float32)
+    
+    # ----- 姿态归一化：以髋部中心为原点，肩宽为尺度 -----
+    # 注意：重采样后的 resampled 是 (T, 132) 格式，每帧 132 维
+    # 关键点索引（MediaPipe 33个点，顺序固定）：
+    # 左髋 = 23, 右髋 = 24, 左肩 = 11, 右肩 = 12
+    for t in range(target_frames):
+        frame = resampled[t]
+        # 提取髋部中点
+        lhip_x = frame[23*4 + 0]
+        lhip_y = frame[23*4 + 1]
+        rhip_x = frame[24*4 + 0]
+        rhip_y = frame[24*4 + 1]
+        hip_center_x = (lhip_x + rhip_x) / 2.0
+        hip_center_y = (lhip_y + rhip_y) / 2.0
+        # 肩宽
+        lshoulder_x = frame[11*4 + 0]
+        rshoulder_x = frame[12*4 + 0]
+        shoulder_width = abs(lshoulder_x - rshoulder_x)
+        if shoulder_width < 1e-6:
+            shoulder_width = 1.0  # 避免除零
+        
+        # 对该帧所有关键点进行平移 + 缩放
+        for i in range(33):
+            idx = i * 4
+            frame[idx]   = (frame[idx]   - hip_center_x) / shoulder_width   # x
+            frame[idx+1] = (frame[idx+1] - hip_center_y) / shoulder_width   # y
+            # z 和 visibility 保持不变（z 已经与相机相关，不易归一化）
+    
+    return resampled   # shape (target_frames, 132)
+
+# 数据集路径（请修改为你的实际路径）
+data_root = "/home/ayn/project3/project12/badminton_stroke_video"   # 文件夹下包含6个子文件夹
+classes = [
+    "forehand drive", "forehand lift", "forehand net shot",
+    "forehand clear", "backhand drive", "backhand net shot"
+]
+class_to_idx = {cls: i for i, cls in enumerate(classes)}
+
+X, y = [], []
+for cls in classes:
+    folder = os.path.join(data_root, cls)
+    if not os.path.isdir(folder):
+        print(f"警告：文件夹 {folder} 不存在，跳过")
+        continue
+    for fname in os.listdir(folder):
+        if fname.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+            path = os.path.join(folder, fname)
+            print(f"处理: {path}")
+            seq = extract_keypoints(path, target_frames=30)
+            if seq is not None:
+                X.append(seq)
+                y.append(class_to_idx[cls])
+
+X = np.array(X, dtype=np.float32)
+y = np.array(y, dtype=np.int64)
+
+# 划分训练集 / 测试集
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+np.save('X_train.npy', X_train)
+np.save('y_train.npy', y_train)
+np.save('X_test.npy', X_test)
+np.save('y_test.npy', y_test)
+
+print(f"预处理完成！")
+print(f"训练集: {X_train.shape}, 测试集: {X_test.shape}")

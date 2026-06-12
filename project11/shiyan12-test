@@ -1,0 +1,80 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import torch
+import torch.nn as nn
+
+# ========== 模型定义==========
+class SkeletonTransformer(nn.Module):
+    def __init__(self, input_dim=132, d_model=128, nhead=4, num_layers=2, dim_feedforward=256, num_classes=6, dropout=0.1, max_len=30):
+        super().__init__()
+        self.embed = nn.Linear(input_dim, d_model)
+        self.pos_embed = nn.Parameter(torch.randn(1, max_len, d_model) * 0.02)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(d_model)
+        self.classifier = nn.Linear(d_model, num_classes)
+        self.dropout = nn.Dropout(dropout)
+    def forward(self, x):
+        x = self.embed(x)
+        x = x + self.pos_embed[:, :x.size(1), :]
+        x = self.transformer(x)
+        x = x.mean(dim=1)
+        x = self.norm(x)
+        x = self.dropout(x)
+        return self.classifier(x)
+
+# ========== 骨架提取函数 ==========
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(static_image_mode=False, model_complexity=1, min_detection_confidence=0.5)
+
+def extract_keypoints(video_path, target_frames=30):
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb)
+        if results.pose_landmarks:
+            landmarks = results.pose_landmarks.landmark
+            frame_kp = []
+            for lm in landmarks:
+                frame_kp.extend([lm.x, lm.y, lm.z, lm.visibility])
+            frames.append(frame_kp)
+    cap.release()
+    if len(frames) == 0:
+        return None
+    # 线性插值重采样到 target_frames
+    x = np.linspace(0, len(frames)-1, target_frames)
+    indices = np.round(x).astype(int)
+    resampled = np.array([frames[i] for i in indices])
+    return resampled  # [target_frames, 132]
+
+# ========== 推理 ==========
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = SkeletonTransformer().to(device)
+# 加载训练好的权重（请确保文件存在）
+model.load_state_dict(torch.load('skeleton_transformer.pth', map_location=device))
+model.eval()
+
+classes = ["forehand drive", "forehand lift", "forehand net shot", 
+           "forehand clear", "backhand drive", "backhand net shot"]
+
+def inference(video_path):
+    seq = extract_keypoints(video_path)
+    if seq is None:
+        print("未检测到人体")
+        return
+    tensor_seq = torch.tensor(seq, dtype=torch.float32).unsqueeze(0).to(device)
+    with torch.no_grad():
+        logits = model(tensor_seq)
+        probs = torch.softmax(logits, dim=1)
+        conf, pred = torch.max(probs, 1)
+    pred_class = classes[pred.item()]
+    print(f"Predicted class: {pred_class}")
+    print(f"Confidence: {conf.item():.4f}")
+
+# 请将 demo_video.mp4 替换为实际视频路径
+inference("/home/ayn/project3/project12/badminton_stroke_video/forehand clear/002.mp4")
