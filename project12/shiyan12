@@ -1,0 +1,103 @@
+import cv2
+import numpy as np
+import glob
+import os
+
+# ===================== 1. 定义棋盘格角点三维坐标 =====================
+pattern_size = (9, 6)          # 内角点数（横向9，纵向6）
+square_size = 20.0             # 方格边长 (mm)
+
+objp = np.zeros((pattern_size[0] * pattern_size[1], 3), dtype=np.float32)
+objp[:, :2] = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T.reshape(-1, 2)
+objp *= square_size
+
+objpoints = []   # 世界坐标
+imgpoints = []   # 图像坐标
+
+# ===================== 2. 读取图片并检测角点 =====================
+image_paths = glob.glob('/home/ayn/project3/project13/photo/*.jpg')
+if not image_paths:
+    print("错误：未找到标定图片")
+    exit()
+
+print(f"发现 {len(image_paths)} 张图片")
+
+# 创建保存角点图片的文件夹
+corner_dir = 'corners_detected'
+os.makedirs(corner_dir, exist_ok=True)
+
+# 亚像素优化终止条件
+criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.001)
+
+for idx, fname in enumerate(image_paths):
+    img = cv2.imread(fname)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 使用 findChessboardCornersSB（OpenCV 4.5.0+）
+    ret, corners = cv2.findChessboardCornersSB(gray, pattern_size, cv2.CALIB_CB_EXHAUSTIVE)
+
+    if ret:
+        print(f"成功检测: {os.path.basename(fname)}")
+        objpoints.append(objp)
+
+        # 亚像素精化
+        corners_sub = cv2.cornerSubPix(gray, corners, (15,15), (-1,-1), criteria)
+        imgpoints.append(corners_sub)
+
+        # 绘制角点并保存图片
+        cv2.drawChessboardCorners(img, pattern_size, corners_sub, ret)
+        save_path = os.path.join(corner_dir, f'corners_{idx:02d}_{os.path.basename(fname)}')
+        cv2.imwrite(save_path, img)
+        print(f"  已保存角点图: {save_path}")
+    else:
+        print(f"角点检测失败: {os.path.basename(fname)}")
+
+# ===================== 3. 相机标定 =====================
+img = cv2.imread(image_paths[0])
+h, w = img.shape[:2]
+
+ret, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+    objpoints, imgpoints, (w, h), None, None
+)
+
+print("\n=== 标定结果 ===")
+print(f"重投影误差 (RMS): {ret:.4f} 像素")
+print(f"内参矩阵 K:\n{K}")
+print(f"畸变参数 D:\n{dist.ravel()}")
+
+# 保存标定参数
+np.savez('calibration_data.npz', K=K, dist=dist, rvecs=rvecs, tvecs=tvecs)
+
+# ===================== 4. 去畸变 =====================
+img_orig = cv2.imread(image_paths[0])
+newcameramtx, roi = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), 1, (w, h))
+dst_roi = cv2.undistort(img_orig, K, dist, None, newcameramtx)
+x, y, w, h = roi
+dst_cropped = dst_roi[y:y+h, x:x+w]
+
+cv2.imwrite('original.jpg', img_orig)
+cv2.imwrite('undistorted.jpg', dst_cropped)
+
+# ===================== 5. 显示对比 =====================
+import matplotlib.pyplot as plt
+plt.figure(figsize=(12, 6))
+plt.subplot(1,2,1)
+plt.imshow(cv2.cvtColor(img_orig, cv2.COLOR_BGR2RGB))
+plt.title('Original')
+plt.axis('off')
+plt.subplot(1,2,2)
+plt.imshow(cv2.cvtColor(dst_cropped, cv2.COLOR_BGR2RGB))
+plt.title('Undistorted')
+plt.axis('off')
+plt.tight_layout()
+plt.savefig('comparison.png')
+plt.show()
+
+print("\n去畸变图像已保存为 undistorted.jpg，对比图保存为 comparison.png")
+
+# ===================== 6. 计算每张图片的重投影误差 =====================
+print("\n每张图片的平均误差和最大误差：")
+for i in range(len(objpoints)):
+    imgpoints2, _ = cv2.projectPoints(objpoints[i], rvecs[i], tvecs[i], K, dist)
+    err = np.linalg.norm(imgpoints[i][:,0,:] - imgpoints2[:,0,:], axis=1)
+    print(f"图片 {i:2d}: 平均 {np.mean(err):.3f} 像素 | 最大 {np.max(err):.3f} 像素")
